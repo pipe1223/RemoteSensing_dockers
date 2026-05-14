@@ -1,0 +1,9 @@
+services:
+  seg2change:
+    build:
+      context: .
+    image: seg2change-demo
+    volumes:
+      - .:/workspace
+    working_dir: /app
+    command: ["smoke-test", "--output-dir", "/workspace/artifacts/smoke"]
