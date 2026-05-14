@@ -1,44 +1,21 @@
-# RemoteSensing Dockers
+# RemoteSensing_dockers
 
-Dockerized remote-sensing model runners and bridge code.
+This repository hosts Docker-oriented packaging for remote sensing models.
 
-## Models
+## Available models
 
-| Model | Folder | Status | Input | Output |
-| --- | --- | --- | --- | --- |
-| Seg2Change | [`Seg2Change/`](Seg2Change/) | Available | JSON annotation file where each `images[*].file_name` contains two image paths | Binary change masks, overlays, manifest files |
+| Model | Status | What is included |
+| --- | --- | --- |
+| Seg2Change | Ready | A Docker-ready wrapper, a verified smoke-test workflow, and a wrapped upstream evaluation path for user-supplied checkpoints, datasets, and a mounted upstream checkout. |
 
 ## Repository layout
 
-```text
-RemoteSensing_dockers/
-├── README.md
-└── Seg2Change/
-    ├── Dockerfile
-    ├── README.md
-    ├── compose.yaml
-    ├── requirements.txt
-    ├── seg2change_json_infer.py
-    ├── examples/
-    └── tests/
-```
+- `Seg2Change/`: container files, runnable demo code, tests, and usage documentation for Seg2Change.
 
-## Quick start for Seg2Change
+## Notes
 
-```bash
-cd Seg2Change
+The current repository contains one model package: `Seg2Change`.
+The Seg2Change package is designed to be useful in two ways:
 
-docker build -t remote-sensing/seg2change:latest .
-
-docker run --rm \
-  -v /absolute/path/to/dataset/root:/data:ro \
-  -v /absolute/path/to/Annotations_test_change_detection.json:/annotations.json:ro \
-  -v "$PWD/outputs":/outputs \
-  remote-sensing/seg2change:latest \
-  --annotations /annotations.json \
-  --image-root /data \
-  --output-dir /outputs \
-  --backend diff
-```
-
-See [`Seg2Change/README.md`](Seg2Change/README.md) for the JSON format, validation mode, production Seg2Change backend notes, and output structure.
+1. It provides a lightweight smoke test that runs end to end and verifies the container wiring.
+2. It can validate and launch the full upstream Seg2Change evaluation workflow when the original source tree, checkpoints, datasets, and GPU runtime are available.
