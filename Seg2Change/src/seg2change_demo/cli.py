@@ -192,6 +192,19 @@ def find_first(record: dict[str, object], keys: tuple[str, ...]) -> str | None:
     return None
 
 
+def find_pair_list(record: dict[str, object], keys: tuple[str, ...]) -> tuple[str, str] | None:
+    for key in keys:
+        value = record.get(key)
+        if (
+            isinstance(value, list)
+            and len(value) >= 2
+            and isinstance(value[0], str)
+            and isinstance(value[1], str)
+        ):
+            return value[0], value[1]
+    return None
+
+
 def build_pairs_from_annotations(data: dict[str, object]) -> list[dict[str, object]]:
     pair_records = data.get("pairs")
     if isinstance(pair_records, list):
@@ -233,8 +246,22 @@ def build_pairs_from_annotations(data: dict[str, object]) -> list[dict[str, obje
         "post",
         "file_name",
     )
+    pair_list_keys = ("file_name", "files", "image_paths", "pair")
 
     for record in image_records:
+        pair_list = find_pair_list(record, pair_list_keys)
+        if pair_list is not None:
+            image_a, image_b = pair_list
+            pairs.append(
+                {
+                    "id": record.get("id", record.get("pair_id", len(pairs))),
+                    "image_a": image_a,
+                    "image_b": image_b,
+                    "record": record,
+                }
+            )
+            continue
+
         image_a = find_first(record, before_keys)
         image_b = find_first(record, after_keys)
         if image_a and image_b:
@@ -296,6 +323,33 @@ def build_pairs_from_annotations(data: dict[str, object]) -> list[dict[str, obje
     return pairs
 
 
+def summarize_annotation_schema(data: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {"top_level_keys": sorted(data.keys())}
+    images = data.get("images")
+    if isinstance(images, list):
+        summary["images_count"] = len(images)
+        first_image = next((record for record in images if isinstance(record, dict)), None)
+        if first_image is not None:
+            summary["first_image_keys"] = sorted(first_image.keys())
+            summary["first_image_sample"] = {
+                key: first_image[key]
+                for key in sorted(first_image.keys())[:8]
+            }
+    annotations = data.get("annotations")
+    if isinstance(annotations, list):
+        summary["annotations_count"] = len(annotations)
+        first_annotation = next((record for record in annotations if isinstance(record, dict)), None)
+        if first_annotation is not None:
+            summary["first_annotation_keys"] = sorted(first_annotation.keys())
+    pairs = data.get("pairs")
+    if isinstance(pairs, list):
+        summary["pairs_count"] = len(pairs)
+        first_pair = next((record for record in pairs if isinstance(record, dict)), None)
+        if first_pair is not None:
+            summary["first_pair_keys"] = sorted(first_pair.keys())
+    return summary
+
+
 def save_annotation_outputs(
     output_dir: Path,
     pair_id: str,
@@ -303,13 +357,47 @@ def save_annotation_outputs(
     image_b_path: Path,
     pred_mask: np.ndarray,
     metrics: dict[str, float | int],
+    gt_mask: np.ndarray | None = None,
 ) -> None:
     pair_dir = ensure_dir(output_dir / str(pair_id))
     shutil.copy2(image_a_path, pair_dir / "A.png")
     shutil.copy2(image_b_path, pair_dir / "B.png")
     write_mask(pair_dir / "pred_mask.png", pred_mask)
+    if gt_mask is not None:
+        write_mask(pair_dir / "label.png", gt_mask)
     with (pair_dir / "metrics.json").open("w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
+
+
+def build_gt_mask_from_annotations(
+    annotations: list[dict[str, object]],
+    image_id: int | str,
+    width: int,
+    height: int,
+) -> np.ndarray | None:
+    relevant = [ann for ann in annotations if ann.get("image_id") == image_id]
+    if not relevant:
+        return None
+
+    canvas = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(canvas)
+
+    for ann in relevant:
+        segmentation = ann.get("segmentation")
+        if isinstance(segmentation, list):
+            polygons = segmentation
+            if polygons and all(isinstance(x, (int, float)) for x in polygons):
+                polygons = [polygons]
+            for polygon in polygons:
+                if (
+                    isinstance(polygon, list)
+                    and len(polygon) >= 6
+                    and all(isinstance(x, (int, float)) for x in polygon)
+                ):
+                    xy = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon) - 1, 2)]
+                    draw.polygon(xy, fill=255)
+
+    return np.asarray(canvas, dtype=np.uint8) > 0
 
 
 def handle_run_annotations(args: argparse.Namespace) -> int:
@@ -336,7 +424,14 @@ def handle_run_annotations(args: argparse.Namespace) -> int:
 
     pairs = build_pairs_from_annotations(data)
     if not pairs:
-        raise ValueError("Could not find image pairs in the annotations JSON")
+        schema_summary = summarize_annotation_schema(data)
+        raise ValueError(
+            "Could not find image pairs in the annotations JSON. "
+            f"Schema summary: {json.dumps(schema_summary, ensure_ascii=True)}"
+        )
+
+    raw_annotations = data.get("annotations")
+    annotations = [ann for ann in raw_annotations if isinstance(ann, dict)] if isinstance(raw_annotations, list) else []
 
     summary: list[dict[str, object]] = []
     for index, pair in enumerate(pairs):
@@ -352,12 +447,19 @@ def handle_run_annotations(args: argparse.Namespace) -> int:
         image_a = load_rgb(image_a_path)
         image_b = load_rgb(image_b_path)
         pred_mask = infer_change_mask(image_a, image_b, threshold=args.threshold)
-        metrics = {
+        metrics: dict[str, float | int] = {
             "changed_pixels_pred": int(pred_mask.sum()),
             "threshold": args.threshold,
             "backend": args.backend,
         }
-        save_annotation_outputs(output_dir, pair_id, image_a_path, image_b_path, pred_mask, metrics)
+        record = pair.get("record", {})
+        image_id = record.get("id") if isinstance(record, dict) else None
+        gt_mask = None
+        if image_id is not None:
+            gt_mask = build_gt_mask_from_annotations(annotations, image_id, image_a.shape[1], image_a.shape[0])
+            if gt_mask is not None:
+                metrics.update(compute_metrics(pred_mask, gt_mask))
+        save_annotation_outputs(output_dir, pair_id, image_a_path, image_b_path, pred_mask, metrics, gt_mask=gt_mask)
         summary.append({"id": pair_id, "status": "ok", "output_dir": str(output_dir / pair_id), **metrics})
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as fh:
