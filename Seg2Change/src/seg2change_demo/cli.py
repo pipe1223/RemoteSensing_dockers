@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,7 +38,13 @@ def apply_json_overrides(args: argparse.Namespace, allowed_keys: set[str]) -> ar
 def normalize_cli_args(argv: list[str]) -> list[str]:
     if not argv:
         return argv
-    known_commands = {"generate-sample", "smoke-test", "prepare-upstream-run", "run-annotations"}
+    known_commands = {
+        "generate-sample",
+        "smoke-test",
+        "prepare-upstream-run",
+        "run-upstream-eval",
+        "run-annotations",
+    }
     if argv[0] in known_commands:
         return argv
     if "--annotations" in argv:
@@ -175,6 +183,20 @@ def validate_required_files(paths: list[Path]) -> list[str]:
         if not path.exists():
             missing.append(str(path))
     return missing
+
+
+def write_json(path: Path, payload: object) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def ensure_trailing_slash(value: str) -> str:
+    return value if value.endswith("/") else value + "/"
+
+
+def shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def resolve_under_root(root: Path, value: str) -> Path:
@@ -400,13 +422,121 @@ def build_gt_mask_from_annotations(
     return np.asarray(canvas, dtype=np.uint8) > 0
 
 
+def get_upstream_weights_root(args: argparse.Namespace, upstream_root: Path) -> Path:
+    configured = getattr(args, "weights_root", None)
+    return Path(configured) if configured else upstream_root / "weights"
+
+
+def get_dino_checkpoint_name(encoder_size: str) -> str:
+    mapping = {
+        "small": "dinov2_vits14_pretrain.pth",
+        "base": "dinov2_vitb14_pretrain.pth",
+    }
+    if encoder_size not in mapping:
+        raise ValueError(f"Unsupported encoder size: {encoder_size}")
+    return mapping[encoder_size]
+
+
+def build_upstream_run_payload(args: argparse.Namespace) -> dict[str, object]:
+    upstream_root = Path(args.upstream_root)
+    dataset_root = Path(args.dataset_root)
+    output_root = ensure_dir(Path(args.output_root))
+    weights_root = get_upstream_weights_root(args, upstream_root)
+    feat_root = Path(getattr(args, "feat_root", "") or (output_root / "features"))
+    checkpoint_path = Path(getattr(args, "checkpoint_path", "") or (weights_root / "cach" / "best.pth"))
+    wrapper_script = Path(__file__).resolve().parents[2] / "scripts" / "run_upstream_eval.py"
+    test_script = upstream_root / "test_cach_ovcd.py"
+
+    required = [
+        wrapper_script,
+        test_script,
+        upstream_root / "dataset" / "ovcd.py",
+        upstream_root / "model" / "ovcd" / "change_head_fdr_dino.py",
+        upstream_root / "model" / "backbone" / "dinov2.py",
+        upstream_root / "configs",
+        dataset_root,
+        checkpoint_path,
+        weights_root / "dinov2" / get_dino_checkpoint_name(args.encoder_size),
+    ]
+
+    if args.ovss_model in {"SegEarth-OV3", "SAM3"}:
+        required.extend(
+            [
+                upstream_root / "seg_model_sam3.py",
+                weights_root / "sam3" / "sam3.pt",
+            ]
+        )
+    elif args.ovss_model == "SegEarth-OV1":
+        required.append(upstream_root / "segearthov1_segmentor.py")
+    else:
+        raise ValueError(f"Unsupported ovss model: {args.ovss_model}")
+
+    missing = validate_required_files(required)
+
+    runner_args = [
+        "--checkpoint_path",
+        str(checkpoint_path),
+        "--dataset_root_path",
+        ensure_trailing_slash(str(dataset_root)),
+        "--save_path",
+        str(output_root),
+        "--test_dataset",
+        args.test_dataset,
+        "--encoder_size",
+        args.encoder_size,
+        "--dino_ft",
+        args.dino_ft,
+        "--crop_size",
+        str(args.crop_size),
+        "--batch_size",
+        str(args.batch_size),
+        "--ovss_model",
+        args.ovss_model,
+        "--feat_path",
+        str(feat_root),
+    ]
+    command = [
+        sys.executable,
+        str(wrapper_script),
+        "--script",
+        str(test_script),
+        "--workdir",
+        str(upstream_root),
+    ]
+    if getattr(args, "cuda_visible_devices", None):
+        command.extend(["--cuda-visible-devices", str(args.cuda_visible_devices)])
+    command.extend(["--", *runner_args])
+
+    payload: dict[str, object] = {
+        "status": "ready" if not missing else "missing_files",
+        "upstream_root": str(upstream_root),
+        "dataset_root": str(dataset_root),
+        "weights_root": str(weights_root),
+        "checkpoint_path": str(checkpoint_path),
+        "feature_root": str(feat_root),
+        "output_root": str(output_root),
+        "working_directory": str(upstream_root),
+        "script": str(test_script),
+        "command": command,
+        "shell_command": shell_join(command),
+        "cuda_visible_devices": getattr(args, "cuda_visible_devices", None),
+    }
+    if missing:
+        payload["missing"] = missing
+    return payload
+
+
 def handle_run_annotations(args: argparse.Namespace) -> int:
     args = apply_json_overrides(
         args,
         {"annotations", "image_root", "output_dir", "backend", "threshold"},
     )
     if args.backend != "diff":
-        raise ValueError(f"Unsupported backend: {args.backend}")
+        raise ValueError(
+            "Unsupported backend for annotation mode: "
+            f"{args.backend}. Use backend=diff for paired-image JSON input, "
+            "or use run-upstream-eval for the real upstream Seg2Change evaluation flow."
+        )
 
     annotations_path = Path(args.annotations)
     image_root = Path(args.image_root)
@@ -472,46 +602,64 @@ def handle_run_annotations(args: argparse.Namespace) -> int:
 def handle_prepare_upstream_run(args: argparse.Namespace) -> int:
     args = apply_json_overrides(
         args,
-        {"upstream_root", "dataset_root", "weights_root", "output_root", "test_dataset"},
+        {
+            "upstream_root",
+            "dataset_root",
+            "weights_root",
+            "output_root",
+            "test_dataset",
+            "checkpoint_path",
+            "feat_root",
+            "batch_size",
+            "crop_size",
+            "encoder_size",
+            "dino_ft",
+            "ovss_model",
+            "cuda_visible_devices",
+        },
     )
-    upstream_root = Path(args.upstream_root)
-    dataset_root = Path(args.dataset_root)
-    weights_root = Path(args.weights_root)
-    output_root = ensure_dir(Path(args.output_root))
-
-    required = [
-        upstream_root / "test_cach_ovcd.py",
-        upstream_root / "train_cach_dino.py",
-        weights_root / "sam3" / "sam3.pt",
-        weights_root / "dinov2" / "dinov2_vitb14_pretrain.pth",
-        weights_root / "cach" / "best.pth",
-        dataset_root,
-    ]
-    missing = validate_required_files(required)
-    if missing:
-        print(json.dumps({"status": "missing_files", "missing": missing}, indent=2))
-        return 1
-
-    cmd = [
-        "python",
-        "test_cach_ovcd.py",
-        "--checkpoint_path",
-        str(weights_root / "cach" / "best.pth"),
-        "--dataset_root_path",
-        str(dataset_root) + "/",
-        "--save_path",
-        str(output_root),
-        "--test_dataset",
-        args.test_dataset,
-    ]
-
-    payload = {
-        "status": "ready",
-        "working_directory": str(upstream_root),
-        "command": cmd,
-    }
+    payload = build_upstream_run_payload(args)
+    write_json(Path(args.output_root) / "upstream-command.json", payload)
     print(json.dumps(payload, indent=2))
-    return 0
+    return 0 if payload["status"] == "ready" else 1
+
+
+def handle_run_upstream_eval(args: argparse.Namespace) -> int:
+    args = apply_json_overrides(
+        args,
+        {
+            "upstream_root",
+            "dataset_root",
+            "weights_root",
+            "output_root",
+            "test_dataset",
+            "checkpoint_path",
+            "feat_root",
+            "batch_size",
+            "crop_size",
+            "encoder_size",
+            "dino_ft",
+            "ovss_model",
+            "cuda_visible_devices",
+            "dry_run",
+        },
+    )
+    payload = build_upstream_run_payload(args)
+    metadata_path = Path(args.output_root) / "upstream-command.json"
+    write_json(metadata_path, payload)
+    if payload["status"] != "ready" or args.dry_run:
+        print(json.dumps(payload, indent=2))
+        return 0 if args.dry_run and payload["status"] == "ready" else int(payload["status"] != "ready")
+
+    completed = subprocess.run(payload["command"], cwd=str(payload["working_directory"]), check=False)
+    result = {
+        **payload,
+        "returncode": completed.returncode,
+        "metadata_path": str(metadata_path),
+    }
+    write_json(Path(args.output_root) / "upstream-run-result.json", result)
+    print(json.dumps(result, indent=2))
+    return completed.returncode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -535,10 +683,36 @@ def build_parser() -> argparse.ArgumentParser:
     prep_parser.add_argument("--config-json")
     prep_parser.add_argument("--upstream-root", required=True)
     prep_parser.add_argument("--dataset-root", required=True)
-    prep_parser.add_argument("--weights-root", required=True)
+    prep_parser.add_argument("--weights-root")
     prep_parser.add_argument("--output-root", required=True)
     prep_parser.add_argument("--test-dataset", default="WHU-CD")
+    prep_parser.add_argument("--checkpoint-path")
+    prep_parser.add_argument("--feat-root")
+    prep_parser.add_argument("--batch-size", type=int, default=1)
+    prep_parser.add_argument("--crop-size", type=int, default=504)
+    prep_parser.add_argument("--encoder-size", default="base")
+    prep_parser.add_argument("--dino-ft", default="frozen")
+    prep_parser.add_argument("--ovss-model", default="SegEarth-OV3")
+    prep_parser.add_argument("--cuda-visible-devices")
     prep_parser.set_defaults(func=handle_prepare_upstream_run)
+
+    upstream_parser = subparsers.add_parser("run-upstream-eval", help="Execute the mounted upstream Seg2Change evaluator")
+    upstream_parser.add_argument("--config-json")
+    upstream_parser.add_argument("--upstream-root", required=True)
+    upstream_parser.add_argument("--dataset-root", required=True)
+    upstream_parser.add_argument("--weights-root")
+    upstream_parser.add_argument("--output-root", required=True)
+    upstream_parser.add_argument("--test-dataset", default="WHU-CD")
+    upstream_parser.add_argument("--checkpoint-path")
+    upstream_parser.add_argument("--feat-root")
+    upstream_parser.add_argument("--batch-size", type=int, default=1)
+    upstream_parser.add_argument("--crop-size", type=int, default=504)
+    upstream_parser.add_argument("--encoder-size", default="base")
+    upstream_parser.add_argument("--dino-ft", default="frozen")
+    upstream_parser.add_argument("--ovss-model", default="SegEarth-OV3")
+    upstream_parser.add_argument("--cuda-visible-devices")
+    upstream_parser.add_argument("--dry-run", action="store_true")
+    upstream_parser.set_defaults(func=handle_run_upstream_eval)
 
     ann_parser = subparsers.add_parser("run-annotations", help="Run annotation-driven change detection")
     ann_parser.add_argument("--config-json")

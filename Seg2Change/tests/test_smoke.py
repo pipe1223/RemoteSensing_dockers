@@ -9,6 +9,7 @@ sys.path.insert(0, "/workspace/RemoteSensing_dockers/Seg2Change/src")
 
 from seg2change_demo.cli import (
     apply_json_overrides,
+    build_upstream_run_payload,
     build_pairs_from_annotations,
     compute_metrics,
     create_sample_triplet,
@@ -49,11 +50,11 @@ class SmokeTestCase(unittest.TestCase):
             sample_dir = root / "pair"
             create_sample_triplet(sample_dir, size=128)
 
-            copy_targets = {
+            shutil_targets = {
                 "before.png": sample_dir / "A.png",
                 "after.png": sample_dir / "B.png",
             }
-            for target_name, source_path in copy_targets.items():
+            for target_name, source_path in shutil_targets.items():
                 (input_dir / target_name).write_bytes(source_path.read_bytes())
 
             annotations_path = root / "annotations.json"
@@ -135,6 +136,63 @@ class SmokeTestCase(unittest.TestCase):
             self.assertEqual(args.input_dir, str(input_dir))
             self.assertEqual(args.output_dir, str(output_dir))
             self.assertEqual(args.threshold, 36)
+
+    def test_upstream_payload_uses_wrapper_and_default_weight_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            upstream_root = root / "upstream" / "Seg2Change"
+            dataset_root = root / "datasets" / "OVCD_Benchmark"
+            output_root = root / "outputs"
+
+            required_dirs = [
+                upstream_root / "dataset",
+                upstream_root / "model" / "ovcd",
+                upstream_root / "model" / "backbone",
+                upstream_root / "configs",
+                upstream_root / "weights" / "sam3",
+                upstream_root / "weights" / "dinov2",
+                upstream_root / "weights" / "cach",
+                dataset_root,
+            ]
+            for path in required_dirs:
+                path.mkdir(parents=True, exist_ok=True)
+
+            required_files = [
+                upstream_root / "test_cach_ovcd.py",
+                upstream_root / "seg_model_sam3.py",
+                upstream_root / "dataset" / "ovcd.py",
+                upstream_root / "model" / "ovcd" / "change_head_fdr_dino.py",
+                upstream_root / "model" / "backbone" / "dinov2.py",
+                upstream_root / "weights" / "sam3" / "sam3.pt",
+                upstream_root / "weights" / "dinov2" / "dinov2_vitb14_pretrain.pth",
+                upstream_root / "weights" / "cach" / "best.pth",
+            ]
+            for path in required_files:
+                path.write_text("stub", encoding="utf-8")
+
+            payload = build_upstream_run_payload(
+                Namespace(
+                    upstream_root=str(upstream_root),
+                    dataset_root=str(dataset_root),
+                    output_root=str(output_root),
+                    weights_root=None,
+                    checkpoint_path=None,
+                    feat_root=None,
+                    test_dataset="WHU-CD",
+                    batch_size=1,
+                    crop_size=504,
+                    encoder_size="base",
+                    dino_ft="frozen",
+                    ovss_model="SegEarth-OV3",
+                    cuda_visible_devices="0",
+                )
+            )
+
+            self.assertEqual(payload["status"], "ready")
+            self.assertIn("run_upstream_eval.py", payload["shell_command"])
+            self.assertIn("--cuda-visible-devices 0", payload["shell_command"])
+            self.assertIn("--test_dataset WHU-CD", payload["shell_command"])
+            self.assertTrue(str(output_root / "features") in payload["shell_command"])
 
 
 if __name__ == "__main__":

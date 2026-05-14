@@ -38,7 +38,23 @@ Because of that, the implemented result is the smallest faithful runnable packag
 
 1. a Docker-ready Seg2Change folder
 2. a verified smoke-test CLI that exercises a change-detection workflow end to end
-3. a documented full-run validation path for the real upstream evaluation workflow
+3. a documented and executable wrapper path for the real upstream evaluation workflow when the upstream checkout, checkpoints, and GPU runtime are mounted into the container
+
+## Files added
+
+- `README.md`
+- `Seg2Change/README.md`
+- `Seg2Change/Dockerfile`
+- `Seg2Change/compose.yaml`
+- `Seg2Change/.dockerignore`
+- `Seg2Change/requirements.txt`
+- `Seg2Change/src/seg2change_demo/__init__.py`
+- `Seg2Change/src/seg2change_demo/cli.py`
+- `Seg2Change/scripts/generate_sample_data.py`
+- `Seg2Change/tests/test_smoke.py`
+- `Seg2Change/scripts/run_upstream_eval.py`
+- `Seg2Change/requirements.upstream.txt`
+- `Seg2Change/docs/implementation-report.md`
 
 ## Validation performed
 
@@ -46,14 +62,20 @@ The following checks were run in the workspace:
 
 - local Python smoke test using the new CLI
 - local unit test execution with `unittest`
-- local annotation-input run using raw Docker-style flags
+- local dry-run validation of the new upstream command builder
 
 The following checks were not possible in the workspace:
 
 - `docker build`
 - `docker run`
-- full upstream Seg2Change evaluation with checkpoints and datasets
+- full upstream Seg2Change evaluation with checkpoints, datasets, CUDA, and the mounted upstream repository
 
 ## Practical outcome
 
-The delivered package is immediately usable for repository organization, onboarding, smoke-test verification, annotation-driven input runs with the lightweight `diff` backend, and preparing a real Seg2Change run once the original source tree, checkpoints, datasets, and GPU runtime are available.
+The delivered package is immediately usable for:
+
+- repository organization
+- onboarding
+- container setup review
+- smoke-test verification
+- preparing and launching a real Seg2Change run once the original source tree, checkpoints, datasets, and GPU runtime are available

@@ -5,19 +5,26 @@ This folder packages a Docker-friendly Seg2Change workflow for the upstream proj
 - Upstream repository: `https://github.com/yogurts-sy/Seg2Change`
 - Paper: `Seg2Change: Adapting Open-Vocabulary Semantic Segmentation Model for Remote Sensing Change Detection`
 
-## What is included
+## What is in this package
 
-- `Dockerfile`: builds a lightweight Python image for the verified smoke-test workflow.
+- `Dockerfile`: builds a lightweight Python image for the verified smoke test workflow.
 - `compose.yaml`: example service definition for local use.
-- `requirements.txt`: minimal runtime requirements for the smoke test.
-- `seg2change_demo.py`: runnable CLI bridge.
-- `src/seg2change_demo/cli.py`: packaged CLI implementation.
-- `tests/test_smoke.py`: local unit coverage for smoke-test, JSON-config, and annotation-input paths.
-- `docs/implementation-report.md`: engineering notes, validation, and known limits.
+- `src/seg2change_demo/cli.py`: runnable CLI for sample generation, smoke testing, and full-run path validation.
+- `scripts/run_upstream_eval.py`: wrapper that launches the upstream evaluator without editing the upstream tree.
+- `requirements.upstream.txt`: upstream Python dependency reference for the GPU-backed evaluation path.
+- `tests/test_smoke.py`: local unit coverage for the smoke-test path.
+- `docs/implementation-report.md`: engineering notes, decisions, validation, and limitations.
 
 ## Why this package is structured this way
 
-The upstream Seg2Change repository depends on a large vendored `sam3` codebase, CUDA-oriented PyTorch and MMCV installs, external checkpoints for SAM3 and DINOv2, and prepared datasets for evaluation. In this workspace, Docker itself was unavailable and the heavy ML stack was not preinstalled, so the practical deliverable is:
+The upstream Seg2Change repository is not a small standalone script. It depends on:
+
+- a large vendored `sam3` codebase
+- CUDA-oriented PyTorch and MMCV installs
+- external checkpoints for SAM3, DINOv2, and the Seg2Change change head
+- prepared datasets for evaluation and training
+
+Inside this workspace, Docker itself was unavailable and the heavy ML stack was not preinstalled, so the practical deliverable is:
 
 1. a verified runnable smoke test that exercises the container and I/O flow end to end
 2. a lightweight annotation-driven entrypoint that can read JSON pair definitions
@@ -41,14 +48,22 @@ docker run --rm \
   --output-dir /workspace/artifacts/smoke
 ```
 
+This command will:
+
+- generate a synthetic pair of bi-temporal sample images
+- run a lightweight change-detection inference pass
+- save a predicted mask and metrics JSON under `/workspace/artifacts/smoke`
+
 ### 2a. Run annotation JSON input
+
+This is the container interface for dataset-backed runs:
 
 ```bash
 docker run --rm \
   -v /absolute/path/to/dataset/root:/data:ro \
   -v /absolute/path/to/Annotations_test_change_detection.json:/annotations.json:ro \
   -v "$PWD/outputs":/outputs \
-  remote-sensing/seg2change:latest \
+  seg2change-demo \
   --annotations /annotations.json \
   --image-root /data \
   --output-dir /outputs \
@@ -98,7 +113,7 @@ Run it like this:
 ```bash
 docker run --rm \
   -v "$(pwd):/workspace" \
-  remote-sensing/seg2change:latest \
+  seg2change-demo \
   --annotations /workspace/annotations.json \
   --image-root /workspace/data \
   --output-dir /workspace/outputs \
@@ -111,9 +126,37 @@ docker run --rm \
 docker compose run --rm seg2change smoke-test --output-dir /workspace/artifacts/smoke
 ```
 
+## Expected smoke-test outputs
+
+The smoke test writes:
+
+- `A.png`
+- `B.png`
+- `label.png`
+- `pred_mask.png`
+- `metrics.json`
+
+Example metrics keys:
+
+- `iou`
+- `precision`
+- `recall`
+- `f1`
+- `changed_pixels_pred`
+- `changed_pixels_gt`
+
 ## Full upstream evaluation path
 
 The real upstream evaluation flow still needs the original Seg2Change source tree plus checkpoints and datasets.
+This package now includes a wrapper that can execute the upstream `test_cach_ovcd.py`
+script directly from a mounted checkout instead of only validating file layout.
+
+What the wrapper does:
+
+- runs the real upstream evaluator
+- keeps the upstream repository mounted read-only if you want
+- removes the upstream script's hardcoded `CUDA_VISIBLE_DEVICES="7"` line at runtime so you can choose the GPU from the container command
+- writes `upstream-command.json` and, after execution, `upstream-run-result.json` under your chosen output folder
 
 ### Validate that layout
 
@@ -124,10 +167,42 @@ docker run --rm \
   prepare-upstream-run \
   --upstream-root /workspace/upstream/Seg2Change \
   --dataset-root /workspace/datasets/OVCD_Benchmark \
-  --weights-root /workspace/upstream/Seg2Change/weights \
   --output-root /workspace/outputs \
   --test-dataset WHU-CD
 ```
+
+The command checks for the expected files and writes the exact wrapped execution
+command to `/workspace/outputs/upstream-command.json`.
+
+### Execute the real upstream evaluation
+
+```bash
+docker run --rm \
+  --gpus all \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -v "$(pwd):/workspace" \
+  seg2change-demo \
+  run-upstream-eval \
+  --upstream-root /workspace/upstream/Seg2Change \
+  --dataset-root /workspace/datasets/OVCD_Benchmark \
+  --output-root /workspace/outputs \
+  --test-dataset WHU-CD \
+  --cuda-visible-devices 0
+```
+
+Notes:
+
+- `--weights-root` is optional when your checkpoints live in `/workspace/upstream/Seg2Change/weights`
+- `--encoder-size` supports `small` and `base`
+- `--ovss-model` supports `SegEarth-OV3`, `SAM3`, and `SegEarth-OV1`
+- `--dry-run` prints the wrapped command without launching the upstream evaluator
+
+### Upstream dependency reference
+
+The smoke-test image intentionally stays lightweight. For a full upstream run,
+use the upstream dependency set in `requirements.upstream.txt` together with the
+CUDA-linked PyTorch, torchvision, xformers, and MMCV versions described in the
+original upstream README.
 
 ## Local development without Docker
 
@@ -135,11 +210,19 @@ docker run --rm \
 python seg2change_demo.py smoke-test --output-dir ./artifacts/smoke
 python seg2change_demo.py --annotations ./annotations.json --image-root ./data --output-dir ./outputs --backend diff
 python seg2change_demo.py --annotations ./annotations.json --image-root ./data --output-dir ./outputs --config-json ./config.json
+python seg2change_demo.py prepare-upstream-run --upstream-root ./upstream/Seg2Change --dataset-root ./datasets/OVCD_Benchmark --output-root ./outputs
+python seg2change_demo.py run-upstream-eval --upstream-root ./upstream/Seg2Change --dataset-root ./datasets/OVCD_Benchmark --output-root ./outputs --test-dataset WHU-CD --dry-run
 python -m unittest discover -s tests
 ```
 
 ## Known limitations
 
-- The annotation mode currently uses the lightweight `diff` backend rather than the full upstream Seg2Change model stack.
-- Full Seg2Change evaluation was not executed in this workspace because Docker, CUDA, and the required checkpoints were unavailable.
-- If your annotation JSON uses a completely custom pairing schema, the bridge may need one more parser rule for that dataset.
+- The smoke test is a container and workflow verification harness, not a claim of reproduced paper metrics.
+- Full Seg2Change evaluation was not executed in this workspace because CUDA, the required checkpoints, and the upstream repository checkout were unavailable.
+- The upstream repository uses additional vendored modules beyond what is needed for the smoke test here.
+
+## Files to read next
+
+- `docs/implementation-report.md`
+- `Dockerfile`
+- `src/seg2change_demo/cli.py`
