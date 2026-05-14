@@ -27,14 +27,15 @@ The upstream Seg2Change repository is not a small standalone script. It depends 
 Inside this workspace, Docker itself was unavailable and the heavy ML stack was not preinstalled, so the practical deliverable is:
 
 1. a verified runnable smoke test that exercises the container and I/O flow end to end
-2. a documented, GPU-ready full-run path for the real upstream evaluation workflow
+2. a lightweight annotation-driven entrypoint that can read JSON pair definitions
+3. a documented, GPU-ready full-run path for the real upstream evaluation workflow
 
 ## Quick start
 
 ### 1. Build the image
 
 ```bash
-docker build -t seg2change-demo .
+docker build -t remote-sensing/seg2change:latest .
 ```
 
 ### 2. Run the smoke test
@@ -42,7 +43,7 @@ docker build -t seg2change-demo .
 ```bash
 docker run --rm \
   -v "$(pwd)/artifacts:/workspace/artifacts" \
-  seg2change-demo \
+  remote-sensing/seg2change:latest \
   smoke-test \
   --output-dir /workspace/artifacts/smoke
 ```
@@ -157,32 +158,12 @@ What the wrapper does:
 - removes the upstream script's hardcoded `CUDA_VISIBLE_DEVICES="7"` line at runtime so you can choose the GPU from the container command
 - writes `upstream-command.json` and, after execution, `upstream-run-result.json` under your chosen output folder
 
-### Expected mounted layout
-
-```text
-Seg2Change/
-  upstream/
-    Seg2Change/
-      test_cach_ovcd.py
-      train_cach_dino.py
-      weights/
-        sam3/
-          sam3.pt
-        dinov2/
-          dinov2_vitb14_pretrain.pth
-        cach/
-          best.pth
-  datasets/
-    OVCD_Benchmark/
-  outputs/
-```
-
 ### Validate that layout
 
 ```bash
 docker run --rm \
   -v "$(pwd):/workspace" \
-  seg2change-demo \
+  remote-sensing/seg2change:latest \
   prepare-upstream-run \
   --upstream-root /workspace/upstream/Seg2Change \
   --dataset-root /workspace/datasets/OVCD_Benchmark \

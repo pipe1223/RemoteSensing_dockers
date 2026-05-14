@@ -9,8 +9,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY seg2change_demo.py .
+COPY src ./src
+COPY scripts ./scripts
+COPY sample_data ./sample_data
+COPY tests ./tests
 COPY README.md .
-COPY implementation_report.md .
+COPY docs ./docs
 
 ENTRYPOINT ["python", "/app/seg2change_demo.py"]
 CMD ["smoke-test", "--output-dir", "/tmp/seg2change-smoke"]
