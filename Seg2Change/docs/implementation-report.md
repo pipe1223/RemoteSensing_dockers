@@ -40,6 +40,17 @@ Because of that, the implemented result is the smallest faithful runnable packag
 2. a verified smoke-test CLI that exercises a change-detection workflow end to end
 3. a documented and executable wrapper path for the real upstream evaluation workflow when the upstream checkout, checkpoints, and GPU runtime are mounted into the container
 
+## Additional update
+
+The uploaded upstream `Seg2Change` repository snapshot is now vendored in this package as `vendor/Seg2Change-main.zip`.
+
+During Docker build, that archive is unpacked into `/app/upstream/Seg2Change`, and the uploaded `exp/CK/best.pth` is mirrored into `weights/cach/best.pth` for the wrapped evaluator.
+
+This changes the practical run model in two ways:
+
+- the helper image no longer requires a separate mounted upstream source checkout for the real Seg2Change path
+- annotation-driven runs can now use `--backend seg2change` to prepare a temporary upstream-style dataset and launch the real upstream evaluator through the wrapper
+
 ## Files added
 
 - `README.md`
@@ -50,11 +61,10 @@ Because of that, the implemented result is the smallest faithful runnable packag
 - `Seg2Change/requirements.txt`
 - `Seg2Change/src/seg2change_demo/__init__.py`
 - `Seg2Change/src/seg2change_demo/cli.py`
-- `Seg2Change/scripts/generate_sample_data.py`
 - `Seg2Change/tests/test_smoke.py`
 - `Seg2Change/scripts/run_upstream_eval.py`
-- `Seg2Change/requirements.upstream.txt`
 - `Seg2Change/docs/implementation-report.md`
+- `Seg2Change/vendor/Seg2Change-main.zip`
 
 ## Validation performed
 
@@ -63,12 +73,13 @@ The following checks were run in the workspace:
 - local Python smoke test using the new CLI
 - local unit test execution with `unittest`
 - local dry-run validation of the new upstream command builder
+- local validation that annotation JSON can be prepared into an upstream-style dataset layout for the real Seg2Change flow
 
 The following checks were not possible in the workspace:
 
 - `docker build`
 - `docker run`
-- full upstream Seg2Change evaluation with checkpoints, datasets, CUDA, and the mounted upstream repository
+- full upstream Seg2Change evaluation with checkpoints, datasets, CUDA, and the mounted GPU runtime
 
 ## Practical outcome
 
@@ -78,4 +89,4 @@ The delivered package is immediately usable for:
 - onboarding
 - container setup review
 - smoke-test verification
-- preparing and launching a real Seg2Change run once the original source tree, checkpoints, datasets, and GPU runtime are available
+- annotation-backed real Seg2Change runs once DINOv2 and SAM3 weights are mounted into the container
