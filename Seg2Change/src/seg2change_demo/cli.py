@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
-DEFAULT_UPSTREAM_ROOT = "/workspace/upstream/Seg2Change"
+DEFAULT_UPSTREAM_ROOT = "/app/upstream/Seg2Change"
 DEFAULT_SEG2CHANGE_TEST_DATASET = "CLCD"
 SEG2CHANGE_ANNOTATION_DATASET_DIRS = {
     "WHU-CD": "WHU-CD-512",
@@ -666,7 +666,7 @@ def run_seg2change_from_annotations(
             "annotations": str(annotations_path),
             "image_root": str(image_root),
             "manifest_path": str(prepared["manifest_path"]),
-            "missing_pairs": prepared["skipped_pairs"],
+            "missing_pairs": prepared["skipped_pairs"]
         }
         write_json(output_dir / "seg2change-run-result.json", payload)
         print(json.dumps(payload, indent=2))
