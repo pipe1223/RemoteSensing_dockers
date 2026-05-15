@@ -1,0 +1,31 @@
+# Runtime outputs
+outputs/
+artifacts/
+features/
+*_cache/
+
+# Upstream model/checkpoint binaries
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+
+# Large vendored archives / generated chunks
+vendor/*.zip
+vendor/*.tar
+vendor/*.tar.gz
+vendor/*.tgz
+vendor/*.part*
+vendor/*.base64
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments
+.env
+.venv/
+venv/
