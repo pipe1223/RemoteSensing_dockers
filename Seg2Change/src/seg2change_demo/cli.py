@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -10,6 +11,16 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+
+DEFAULT_UPSTREAM_ROOT = "/workspace/upstream/Seg2Change"
+DEFAULT_SEG2CHANGE_TEST_DATASET = "CLCD"
+SEG2CHANGE_ANNOTATION_DATASET_DIRS = {
+    "WHU-CD": "WHU-CD-512",
+    "LEVIR-CD": "LEVIR-CD-512",
+    "DSIFN-CD": "DSIFN-512",
+    "CLCD": "CLCD-512",
+}
 
 
 def ensure_dir(path: Path) -> Path:
@@ -526,17 +537,204 @@ def build_upstream_run_payload(args: argparse.Namespace) -> dict[str, object]:
     return payload
 
 
+def sanitize_identifier(value: object, fallback: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")
+    return cleaned or fallback
+
+
+def safe_link_or_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        destination.unlink()
+    try:
+        destination.symlink_to(source)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def resolve_supported_seg2change_dataset(test_dataset: str) -> str:
+    if test_dataset not in SEG2CHANGE_ANNOTATION_DATASET_DIRS:
+        supported = ", ".join(sorted(SEG2CHANGE_ANNOTATION_DATASET_DIRS))
+        raise ValueError(
+            f"Unsupported seg2change test dataset for annotation mode: {test_dataset}. "
+            f"Supported values: {supported}."
+        )
+    return test_dataset
+
+
+def prepare_seg2change_annotation_dataset(
+    pairs: list[dict[str, object]],
+    annotations: list[dict[str, object]],
+    image_root: Path,
+    output_dir: Path,
+    test_dataset: str,
+) -> dict[str, object]:
+    dataset_name = resolve_supported_seg2change_dataset(test_dataset)
+    dataset_dir_name = SEG2CHANGE_ANNOTATION_DATASET_DIRS[dataset_name]
+    prepared_root = output_dir / "_seg2change_annotation_dataset"
+    dataset_dir = prepared_root / dataset_dir_name / "test"
+    if prepared_root.exists():
+        shutil.rmtree(prepared_root)
+    a_dir = ensure_dir(dataset_dir / "A")
+    b_dir = ensure_dir(dataset_dir / "B")
+    label_dir = ensure_dir(dataset_dir / "label")
+
+    manifest: list[dict[str, object]] = []
+    for index, pair in enumerate(pairs):
+        pair_id = sanitize_identifier(pair.get("id"), f"pair-{index:06d}")
+        image_a_path = resolve_under_root(image_root, str(pair["image_a"]))
+        image_b_path = resolve_under_root(image_root, str(pair["image_b"]))
+        pair_missing = validate_required_files([image_a_path, image_b_path])
+        if pair_missing:
+            manifest.append({"id": pair_id, "status": "missing_images", "missing": pair_missing})
+            continue
+
+        ext = image_a_path.suffix if image_a_path.suffix else ".png"
+        file_name = f"{index:06d}{ext}"
+        dest_a = a_dir / file_name
+        dest_b = b_dir / file_name
+        safe_link_or_copy(image_a_path.resolve(), dest_a)
+        safe_link_or_copy(image_b_path.resolve(), dest_b)
+
+        record = pair.get("record", {})
+        width = int(record.get("width", 0)) if isinstance(record, dict) else 0
+        height = int(record.get("height", 0)) if isinstance(record, dict) else 0
+        if width <= 0 or height <= 0:
+            with Image.open(image_a_path) as image:
+                width, height = image.size
+
+        image_id = record.get("id") if isinstance(record, dict) else None
+        gt_mask = build_gt_mask_from_annotations(annotations, image_id, width, height) if image_id is not None else None
+        if gt_mask is None:
+            gt_mask = np.zeros((height, width), dtype=bool)
+            label_status = "empty"
+        else:
+            label_status = "from_annotations"
+        write_mask(label_dir / file_name, gt_mask)
+        manifest.append(
+            {
+                "id": pair_id,
+                "status": "prepared",
+                "file_name": file_name,
+                "image_a": str(image_a_path),
+                "image_b": str(image_b_path),
+                "label_status": label_status,
+            }
+        )
+
+    manifest_path = output_dir / "seg2change-annotation-manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "test_dataset": dataset_name,
+            "prepared_root": str(prepared_root),
+            "prepared_dataset_dir": str(dataset_dir),
+            "pairs": manifest,
+        },
+    )
+    return {
+        "dataset_root": prepared_root,
+        "dataset_dir": dataset_dir,
+        "manifest_path": manifest_path,
+        "prepared_pairs": [entry for entry in manifest if entry["status"] == "prepared"],
+        "skipped_pairs": [entry for entry in manifest if entry["status"] != "prepared"],
+        "test_dataset": dataset_name,
+    }
+
+
+def run_seg2change_from_annotations(
+    args: argparse.Namespace,
+    annotations_path: Path,
+    image_root: Path,
+    output_dir: Path,
+    pairs: list[dict[str, object]],
+    annotations: list[dict[str, object]],
+) -> int:
+    prepared = prepare_seg2change_annotation_dataset(
+        pairs=pairs,
+        annotations=annotations,
+        image_root=image_root,
+        output_dir=output_dir,
+        test_dataset=args.test_dataset,
+    )
+    if not prepared["prepared_pairs"]:
+        payload = {
+            "status": "missing_images",
+            "annotations": str(annotations_path),
+            "image_root": str(image_root),
+            "manifest_path": str(prepared["manifest_path"]),
+            "missing_pairs": prepared["skipped_pairs"],
+        }
+        write_json(output_dir / "seg2change-run-result.json", payload)
+        print(json.dumps(payload, indent=2))
+        return 1
+
+    upstream_args = argparse.Namespace(
+        upstream_root=args.upstream_root,
+        dataset_root=str(prepared["dataset_root"]),
+        weights_root=args.weights_root,
+        output_root=str(output_dir / "seg2change-upstream"),
+        test_dataset=prepared["test_dataset"],
+        checkpoint_path=args.checkpoint_path,
+        feat_root=args.feat_root,
+        batch_size=args.batch_size,
+        crop_size=args.crop_size,
+        encoder_size=args.encoder_size,
+        dino_ft=args.dino_ft,
+        ovss_model=args.ovss_model,
+        cuda_visible_devices=args.cuda_visible_devices,
+    )
+    payload = build_upstream_run_payload(upstream_args)
+    payload["annotations"] = str(annotations_path)
+    payload["image_root"] = str(image_root)
+    payload["manifest_path"] = str(prepared["manifest_path"])
+    payload["prepared_pairs"] = len(prepared["prepared_pairs"])
+    if prepared["skipped_pairs"]:
+        payload["skipped_pairs"] = prepared["skipped_pairs"]
+
+    metadata_path = output_dir / "seg2change-run-command.json"
+    write_json(metadata_path, payload)
+    if payload["status"] != "ready" or args.dry_run:
+        print(json.dumps(payload, indent=2))
+        return 0 if args.dry_run and payload["status"] == "ready" else int(payload["status"] != "ready")
+
+    completed = subprocess.run(payload["command"], cwd=str(payload["working_directory"]), check=False)
+    result = {
+        **payload,
+        "returncode": completed.returncode,
+        "metadata_path": str(metadata_path),
+    }
+    write_json(output_dir / "seg2change-run-result.json", result)
+    print(json.dumps(result, indent=2))
+    return completed.returncode
+
+
 def handle_run_annotations(args: argparse.Namespace) -> int:
     args = apply_json_overrides(
         args,
-        {"annotations", "image_root", "output_dir", "backend", "threshold"},
+        {
+            "annotations",
+            "image_root",
+            "output_dir",
+            "backend",
+            "threshold",
+            "upstream_root",
+            "weights_root",
+            "checkpoint_path",
+            "feat_root",
+            "batch_size",
+            "crop_size",
+            "encoder_size",
+            "dino_ft",
+            "ovss_model",
+            "cuda_visible_devices",
+            "test_dataset",
+            "dry_run",
+        },
     )
-    if args.backend != "diff":
-        raise ValueError(
-            "Unsupported backend for annotation mode: "
-            f"{args.backend}. Use backend=diff for paired-image JSON input, "
-            "or use run-upstream-eval for the real upstream Seg2Change evaluation flow."
-        )
 
     annotations_path = Path(args.annotations)
     image_root = Path(args.image_root)
@@ -562,6 +760,14 @@ def handle_run_annotations(args: argparse.Namespace) -> int:
 
     raw_annotations = data.get("annotations")
     annotations = [ann for ann in raw_annotations if isinstance(ann, dict)] if isinstance(raw_annotations, list) else []
+
+    if args.backend == "seg2change":
+        return run_seg2change_from_annotations(args, annotations_path, image_root, output_dir, pairs, annotations)
+    if args.backend != "diff":
+        raise ValueError(
+            "Unsupported backend for annotation mode: "
+            f"{args.backend}. Supported values: diff, seg2change."
+        )
 
     summary: list[dict[str, object]] = []
     for index, pair in enumerate(pairs):
@@ -721,6 +927,18 @@ def build_parser() -> argparse.ArgumentParser:
     ann_parser.add_argument("--output-dir", required=True)
     ann_parser.add_argument("--backend", default="diff")
     ann_parser.add_argument("--threshold", type=int, default=36)
+    ann_parser.add_argument("--upstream-root", default=DEFAULT_UPSTREAM_ROOT)
+    ann_parser.add_argument("--weights-root")
+    ann_parser.add_argument("--checkpoint-path")
+    ann_parser.add_argument("--feat-root")
+    ann_parser.add_argument("--batch-size", type=int, default=1)
+    ann_parser.add_argument("--crop-size", type=int, default=504)
+    ann_parser.add_argument("--encoder-size", default="base")
+    ann_parser.add_argument("--dino-ft", default="frozen")
+    ann_parser.add_argument("--ovss-model", default="SegEarth-OV3")
+    ann_parser.add_argument("--cuda-visible-devices")
+    ann_parser.add_argument("--test-dataset", default=DEFAULT_SEG2CHANGE_TEST_DATASET)
+    ann_parser.add_argument("--dry-run", action="store_true")
     ann_parser.set_defaults(func=handle_run_annotations)
 
     return parser

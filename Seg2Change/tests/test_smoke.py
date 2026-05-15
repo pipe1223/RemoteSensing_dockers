@@ -1,7 +1,7 @@
 import json
 from argparse import Namespace
-import tempfile
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,14 +9,15 @@ sys.path.insert(0, "/workspace/RemoteSensing_dockers/Seg2Change/src")
 
 from seg2change_demo.cli import (
     apply_json_overrides,
-    build_upstream_run_payload,
     build_pairs_from_annotations,
+    build_upstream_run_payload,
     compute_metrics,
     create_sample_triplet,
     infer_change_mask,
     load_mask,
     load_rgb,
     main,
+    prepare_seg2change_annotation_dataset,
 )
 
 
@@ -89,6 +90,124 @@ class SmokeTestCase(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((output_dir / "sample-1" / "pred_mask.png").exists())
             self.assertTrue((output_dir / "summary.json").exists())
+
+    def test_prepare_seg2change_annotation_dataset_creates_upstream_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_root = root / "data"
+            sample_dir = root / "sample"
+            output_dir = root / "outputs"
+            create_sample_triplet(sample_dir, size=128)
+            (image_root / "RGB" / "CDD" / "images").mkdir(parents=True, exist_ok=True)
+            (image_root / "RGB" / "CDD" / "change_images").mkdir(parents=True, exist_ok=True)
+            image_a_rel = Path("RGB/CDD/images/test+A+00001.png")
+            image_b_rel = Path("RGB/CDD/change_images/test+B+00001.png")
+            (image_root / image_a_rel).write_bytes((sample_dir / "A.png").read_bytes())
+            (image_root / image_b_rel).write_bytes((sample_dir / "B.png").read_bytes())
+            data = {
+                "images": [
+                    {
+                        "id": 1,
+                        "file_name": [str(image_a_rel), str(image_b_rel)],
+                        "width": 128,
+                        "height": 128,
+                    }
+                ],
+                "annotations": [
+                    {
+                        "image_id": 1,
+                        "segmentation": [[10, 10, 64, 10, 64, 64, 10, 64]],
+                    }
+                ],
+            }
+            prepared = prepare_seg2change_annotation_dataset(
+                pairs=build_pairs_from_annotations(data),
+                annotations=data["annotations"],
+                image_root=image_root,
+                output_dir=output_dir,
+                test_dataset="CLCD",
+            )
+
+            dataset_dir = Path(prepared["dataset_dir"])
+            self.assertTrue((dataset_dir / "A" / "000000.png").exists())
+            self.assertTrue((dataset_dir / "B" / "000000.png").exists())
+            self.assertTrue((dataset_dir / "label" / "000000.png").exists())
+            self.assertEqual(len(prepared["prepared_pairs"]), 1)
+
+    def test_seg2change_annotation_backend_supports_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            input_dir = root / "images"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            sample_dir = root / "pair"
+            create_sample_triplet(sample_dir, size=128)
+            (input_dir / "before.png").write_bytes((sample_dir / "A.png").read_bytes())
+            (input_dir / "after.png").write_bytes((sample_dir / "B.png").read_bytes())
+
+            annotations_path = root / "annotations.json"
+            annotations_path.write_text(
+                json.dumps(
+                    {
+                        "pairs": [
+                            {
+                                "id": "sample-1",
+                                "image_a": "before.png",
+                                "image_b": "after.png",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            upstream_root = root / "upstream" / "Seg2Change"
+            dataset_root = root / "outputs" / "_seg2change_annotation_dataset"
+            output_root = root / "outputs"
+            required_dirs = [
+                upstream_root / "dataset",
+                upstream_root / "model" / "ovcd",
+                upstream_root / "model" / "backbone",
+                upstream_root / "configs",
+                upstream_root / "weights" / "sam3",
+                upstream_root / "weights" / "dinov2",
+                upstream_root / "weights" / "cach",
+            ]
+            for path in required_dirs:
+                path.mkdir(parents=True, exist_ok=True)
+            required_files = [
+                upstream_root / "test_cach_ovcd.py",
+                upstream_root / "seg_model_sam3.py",
+                upstream_root / "dataset" / "ovcd.py",
+                upstream_root / "model" / "ovcd" / "change_head_fdr_dino.py",
+                upstream_root / "model" / "backbone" / "dinov2.py",
+                upstream_root / "weights" / "sam3" / "sam3.pt",
+                upstream_root / "weights" / "dinov2" / "dinov2_vitb14_pretrain.pth",
+                upstream_root / "weights" / "cach" / "best.pth",
+            ]
+            for path in required_files:
+                path.write_text("stub", encoding="utf-8")
+
+            exit_code = main(
+                [
+                    "--annotations",
+                    str(annotations_path),
+                    "--image-root",
+                    str(input_dir),
+                    "--output-dir",
+                    str(output_root),
+                    "--backend",
+                    "seg2change",
+                    "--upstream-root",
+                    str(upstream_root),
+                    "--test-dataset",
+                    "CLCD",
+                    "--dry-run",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((output_root / "seg2change-run-command.json").exists())
+            self.assertTrue((dataset_root / "CLCD-512" / "test" / "A" / "000000.png").exists())
 
     def test_metrics_are_reasonable_for_generated_sample(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
